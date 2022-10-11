@@ -63,7 +63,7 @@ def test_all_op(target, opname, cases_dir):
     print("======================")
     print("Test all operators...")
     flag = False
-    if opname in ["add"]:
+    if opname in ["add", "logaddexp2"]:
         test_op(target, opname, cases_dir)
     else:
         flag = True
