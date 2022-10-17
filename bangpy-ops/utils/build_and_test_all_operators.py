@@ -68,7 +68,7 @@ def test_all_op(target, opname, cases_dir):
     else:
         flag = True
         if target is not None:
-            pytest.main(["-s", "--target=" + target, *test_files])
+            pytest.main(["-s", "-x", "--target=" + target, *test_files])
         else:
             pytest.main(["-s", *test_files])
     return flag
