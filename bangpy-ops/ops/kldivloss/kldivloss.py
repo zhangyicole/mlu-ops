@@ -86,7 +86,6 @@ class KlDivLoss(object):
         )
         # NRAM is divided into 6 main parts
         # 4 * 1024：reserved for other variables
-
         # # Check parameters.
         # if not ((self.dtype in DTYPES) and (self.target in TARGET_LIST)):
         #     raise KeyError("please pass correct parameters.")
@@ -111,10 +110,8 @@ class KlDivLoss(object):
             (sumpool_kernel_size,),
         )
         temp_buffer = temp_buffer_pool.reshape((computed_size,))
-        if self.reduction == 2:
-            tcp.divide(temp_buffer, temp_buffer, self.totalData)
         tcp.sum(sum_buf, temp_buffer)
-        sumvar[0] = sumvar[0] + sum_buf[0]
+        sumvar = sumvar + tcp.cast(sum_buf[0], "float32")
 
     # for calculation
     def numCompute(
@@ -125,14 +122,6 @@ class KlDivLoss(object):
         flag: ty.int32,
         temp1: ty.Buffer("nram"),
     ) -> None:
-        # if flag == 0:
-        #     tcp.log(ou, tar)  # high_precision=False
-        #     tcp.subtract(ou, ou, inp)
-        #     tcp.multiply(ou, tar, ou)
-        # else:  # flag == 1:
-        #     tcp.exp(ou, tar, "exp_less_0")  # todo: delete "exp_less_0"?
-        #     tcp.subtract(tar, tar, inp)
-        #     tcp.multiply(ou, ou, tar)
         if flag == 0:
             if self.dtype == "float16":
                 tcp.type_convert(temp1, tar, 0)
@@ -143,7 +132,7 @@ class KlDivLoss(object):
             tcp.subtract(ou, ou, inp)
             tcp.multiply(ou, tar, ou)
         else:  # flag == 1:
-            tcp.exp(ou, tar)  # todo: delete "exp_less_0"?
+            tcp.exp(ou, tar, "exp_less_0")  # todo: delete "exp_less_0"?
             tcp.subtract(tar, tar, inp)
             tcp.multiply(ou, ou, tar)
 
@@ -156,17 +145,17 @@ class KlDivLoss(object):
         batchLength: ty.int32,
         reduction: ty.int32,
         log_target: ty.int32,
+        reduction_resultG: ty.handle,
     ) -> None:
 
         # declare I/O buffer
         totalData = batchSize * batchLength
-        self.reduction = reduction
-        self.totalData = totalData
         inputG = tcp.match_buffer(inputG, [batchSize, batchLength], dtype=self.dtype)
         targetG = tcp.match_buffer(targetG, [batchSize, batchLength], dtype=self.dtype)
         outG = tcp.match_buffer(outG, [totalData], dtype=self.dtype)
+        reduction_resultG = tcp.match_buffer(reduction_resultG, [1], dtype="float32")
         data_tempG = tcp.alloc_buffer(
-            [64], dtype=self.dtype, scope="gdram"
+            [64], dtype="float32", scope="gdram"
         )  # save the sum of each core, we assume that task_num <= 64
 
         inputG = inputG.flatten()
@@ -196,10 +185,7 @@ class KlDivLoss(object):
                     )
                 # variables related to split
                 start = task_id * (totalData // self.task_num)
-                sumvar = tcp.alloc_buffer(
-                    [64], dtype=self.dtype, scope="nram"
-                )  # save the sum of each core in NRAM and tcp.assign needs to be 64-element aligned
-                tcp.assign(sumvar, tcp.cast(0, self.dtype))
+                sumvar = 0.0
                 sum_buf = tcp.alloc_buffer(
                     [64], dtype=self.dtype, scope="nram"
                 )  # Save temporary result and tcp.assign needs to be 64-element aligned
@@ -315,20 +301,14 @@ class KlDivLoss(object):
                                 (sumpool_kernel_size,),
                             )
                             temp_buffer = temp_buffer_pool.reshape((computed_size,))
-                            if reduction == 2:
-                                tcp.divide(temp_buffer, temp_buffer, totalData)
                             tcp.sum(sum_buf, temp_buffer)
-                            sumvar[0] = sumvar[0] + sum_buf[0]
+                            sumvar = sumvar + tcp.cast(sum_buf[0], "float32")
                             if (data_rem_n % computed_size) > 0:
                                 for k in range(begin=data_rem_n_temp, end=data_rem_n):
-                                    sumvar[0] = sumvar[0] + buffer_out[k]
+                                    sumvar = sumvar + tcp.cast(buffer_out[k], "float32")
                         else:  # calculate it one by one when the size is small
-                            if reduction == 2:
-                                tcp.divide(
-                                    buffer_out[:data_rem_n], buffer_out[:data_rem_n], totalData
-                                )
                             for k in range(begin=0, end=data_rem_n):
-                                sumvar[0] = sumvar[0] + buffer_out[k]
+                                sumvar = sumvar + tcp.cast(buffer_out[k], "float32")
 
                     # data copy
                     if reduction == 0:
@@ -336,19 +316,19 @@ class KlDivLoss(object):
 
                 if reduction != 0:
                     # todo: tcp.sync_all() is not supported
-                    data_tempG[task_id % self.task_num] = sumvar[0]
-                    total = tcp.alloc_buffer([64], dtype=self.dtype, scope="nram")
-                    tcp.assign(total, tcp.cast(0, self.dtype))
+                    data_tempG[task_id % self.task_num] = sumvar
                     if task_id == 0:
-                        for i in range(begin=0, end=self.task_num):
-                            total[0] = total[0] + data_tempG[i]
+                        total = tcp.alloc_buffer([64], dtype="float32", scope="nram")
+                        tcp.memcpy(total, data_tempG)
+                        for i in range(begin=1, end=self.task_num):  # 1 to 63
+                            total[0] = total[0] + total[i]
                         # reduction = mean
                         if reduction == 2:
-                            total[0] = total[0]
-                        # reduction = batchmen
+                            total[0] = total[0] / totalData
+                        # reduction = batchmean
                         if reduction == 3:
                             total[0] = total[0] / batchSize
-                        outG[0] = total[0]
+                        tcp.memcpy(reduction_resultG[0], total[0])
 
 
 @tcp.register_mlu_op(DTYPES, TARGET_LIST, KERNEL_NAME)
